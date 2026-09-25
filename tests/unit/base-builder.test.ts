@@ -15,6 +15,7 @@ vi.mock('@/utils/dir', () => ({
 }));
 
 import BaseBuilder from '@/builders/BaseBuilder';
+import WinBuilder from '@/builders/WinBuilder';
 import {
   _resetPackageManagerCache,
   configureCargoRegistry,
@@ -32,6 +33,7 @@ class TestBuilder extends BaseBuilder {
 }
 
 const originalCnMirrorEnv = process.env[CN_MIRROR_ENV];
+const originalCargoTargetDir = process.env.CARGO_TARGET_DIR;
 const tempDirs: string[] = [];
 
 const GENERATED_MIRROR_CONFIG = `[source.crates-io]
@@ -95,6 +97,12 @@ describe('BaseBuilder guards', () => {
       process.env[CN_MIRROR_ENV] = originalCnMirrorEnv;
     }
 
+    if (originalCargoTargetDir === undefined) {
+      delete process.env.CARGO_TARGET_DIR;
+    } else {
+      process.env.CARGO_TARGET_DIR = originalCargoTargetDir;
+    }
+
     await Promise.all(tempDirs.splice(0).map((dir) => fsExtra.remove(dir)));
   });
 
@@ -155,16 +163,20 @@ describe('BaseBuilder guards', () => {
   it('uses official npm registry by default', () => {
     const command = getInstallCommand('pnpm', false);
 
-    expect(command).toContain('pnpm install');
-    expect(command).not.toContain('registry.npmmirror.com');
+    expect(command).toEqual({ executable: 'pnpm', args: ['install'] });
   });
 
   it('uses npmmirror only when CN mirror is enabled', () => {
     const command = getInstallCommand('npm', true);
 
-    expect(command).toContain(
-      'npm install --registry=https://registry.npmmirror.com --legacy-peer-deps',
-    );
+    expect(command).toEqual({
+      executable: 'npm',
+      args: [
+        'install',
+        '--registry=https://registry.npmmirror.com',
+        '--legacy-peer-deps',
+      ],
+    });
   });
 
   it('uses pnpm when the installed major matches the pinned package manager', async () => {
@@ -294,10 +306,82 @@ describe('BaseBuilder guards', () => {
     } as any);
 
     const command = (builder as any).getBuildCommand('pnpm');
-    const normalizedCommand = command.replace(/\\/g, '/');
+    const normalizedCommand = command.args.join(' ').replace(/\\/g, '/');
 
     expect(normalizedCommand).toContain('src-tauri/.pake/tauri.conf.json');
-    expect(command).toContain('--features cli-build');
+    expect(command.args).toContain('--features');
+    expect(
+      command.args.find((arg: string) => arg.startsWith('cli-build')),
+    ).toBeTruthy();
+  });
+
+  it.each(['npm', 'pnpm'])(
+    'preserves build arguments for %s',
+    (packageManager) => {
+      const builder = new TestBuilder({ debug: true } as any);
+      const configPath = path.join(
+        'config with spaces',
+        '$(printf untouched).json',
+      );
+      const command = (builder as any).buildBaseCommand(
+        packageManager,
+        configPath,
+        'aarch64-apple-darwin',
+      );
+      expect(command.executable).toBe(packageManager);
+      expect(command.args.slice(0, packageManager === 'npm' ? 3 : 2)).toEqual(
+        packageManager === 'npm'
+          ? ['run', 'build:debug', '--']
+          : ['run', 'build:debug'],
+      );
+      const configIndex = command.args.indexOf('-c');
+      expect(command.args[configIndex + 1]).toBe(configPath);
+      expect(command.args.slice(configIndex + 2, configIndex + 5)).toEqual([
+        '--target',
+        'aarch64-apple-darwin',
+        '--verbose',
+      ]);
+    },
+  );
+
+  it('copies Windows build artifacts from CARGO_TARGET_DIR when it is set', () => {
+    const cargoTargetDir = path.join(process.cwd(), '.short-cargo-target');
+    process.env.CARGO_TARGET_DIR = cargoTargetDir;
+
+    const builder = new WinBuilder({
+      debug: false,
+      name: 'ChatGPT',
+      targets: 'x64',
+    } as any);
+
+    const appPath = (builder as any).getBuildAppPath(
+      process.cwd(),
+      'ChatGPT_1.0.0_x64_en-US',
+      'msi',
+    );
+    const binaryPath = (builder as any).getRawBinarySourcePath(
+      process.cwd(),
+      'ChatGPT',
+    );
+
+    expect(appPath).toBe(
+      path.join(
+        cargoTargetDir,
+        'x86_64-pc-windows-msvc',
+        'release',
+        'bundle',
+        'msi',
+        'ChatGPT_1.0.0_x64_en-US.msi',
+      ),
+    );
+    expect(binaryPath).toBe(
+      path.join(
+        cargoTargetDir,
+        'x86_64-pc-windows-msvc',
+        'release',
+        'pake-chatgpt.exe',
+      ),
+    );
   });
 
   it('tracks generated Pake config files in the Cargo build script', async () => {
